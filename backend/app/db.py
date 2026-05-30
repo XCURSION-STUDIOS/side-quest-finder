@@ -43,3 +43,23 @@ def ensure_sqlite_columns():
             for column, statement in migrations.items():
                 if column not in item_columns:
                     conn.execute(text(statement))
+
+        if "discoveryrun" in tables:
+            run_columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(discoveryrun)"))
+            }
+            run_migrations = {
+                "completed_at": "ALTER TABLE discoveryrun ADD COLUMN completed_at DATETIME",
+                "status": "ALTER TABLE discoveryrun ADD COLUMN status TEXT DEFAULT 'running'",
+                "query_count": "ALTER TABLE discoveryrun ADD COLUMN query_count INTEGER DEFAULT 0",
+                "source_count": "ALTER TABLE discoveryrun ADD COLUMN source_count INTEGER DEFAULT 0",
+                "candidate_count": "ALTER TABLE discoveryrun ADD COLUMN candidate_count INTEGER DEFAULT 0",
+                "accepted_count": "ALTER TABLE discoveryrun ADD COLUMN accepted_count INTEGER DEFAULT 0",
+                "rejected_count": "ALTER TABLE discoveryrun ADD COLUMN rejected_count INTEGER DEFAULT 0",
+                "summary": "ALTER TABLE discoveryrun ADD COLUMN summary TEXT",
+                "settings_json": "ALTER TABLE discoveryrun ADD COLUMN settings_json TEXT DEFAULT '{}'",
+            }
+            for column, statement in run_migrations.items():
+                if column not in run_columns:
+                    conn.execute(text(statement))

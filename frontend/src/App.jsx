@@ -33,6 +33,11 @@ const QUALITY_FILTER_OPTIONS = [
   { value: 'balanced', label: 'balanced' },
   { value: 'exploratory', label: 'exploratory' },
 ]
+const DISCOVERY_MODE_OPTIONS = [
+  { value: 'precise', label: 'precise' },
+  { value: 'balanced', label: 'balanced' },
+  { value: 'wide', label: 'wide net' },
+]
 
 const SUGGESTED_INTERESTS = [
   'climbing',
@@ -62,6 +67,7 @@ const NAV_ITEMS = [
   { id: 'discover', icon: '>', label: 'discover' },
   { id: 'briefing', icon: '!', label: 'briefing' },
   { id: 'shortlist', icon: '$', label: 'shortlist' },
+  { id: 'history', icon: '~', label: 'history' },
   { id: 'focus', icon: '@', label: 'focus' },
   { id: 'personalise', icon: '+', label: 'personalise' },
   { id: 'sources', icon: '#', label: 'sources' },
@@ -104,6 +110,9 @@ function App(){
   const [input, setInput] = useState('')
   const [items, setItems] = useState(null)
   const [shortlistItems, setShortlistItems] = useState([])
+  const [runs, setRuns] = useState([])
+  const [runEvents, setRunEvents] = useState([])
+  const [selectedRunId, setSelectedRunId] = useState(null)
   const [showServices, setShowServices] = useState(false)
   const [settings, setSettings] = useState({
     dailySummary: true,
@@ -148,6 +157,7 @@ function App(){
 
     fetchSummary()
     fetchShortlist()
+    fetchRuns()
   }, [])
 
   useEffect(() => {
@@ -206,12 +216,41 @@ function App(){
       .catch(() => setShortlistItems([]))
   }
 
+  function fetchRuns(){
+    fetch(`${API}/discovery/runs`)
+      .then(response => response.json())
+      .then(data => {
+        const nextRuns = data.runs || []
+        setRuns(nextRuns)
+        if(nextRuns.length){
+          const nextId = selectedRunId || nextRuns[0].id
+          setSelectedRunId(nextId)
+          fetchRunEvents(nextId)
+        } else {
+          setRunEvents([])
+        }
+      })
+      .catch(() => {
+        setRuns([])
+        setRunEvents([])
+      })
+  }
+
+  function fetchRunEvents(runId){
+    if(!runId) return
+    fetch(`${API}/discovery/runs/${runId}/events`)
+      .then(response => response.json())
+      .then(data => setRunEvents(data.events || []))
+      .catch(() => setRunEvents([]))
+  }
+
   function runDiscovery(){
     fetch(`${API}/discovery/run`, { method: 'POST' })
       .then(response => response.json())
       .then(data => {
         setItems(data.items || [])
         fetchShortlist()
+        fetchRuns()
       })
       .catch(() => setItems([]))
   }
@@ -313,6 +352,18 @@ function App(){
               key="shortlist"
               items={shortlistItems}
               patchItem={patchItem}
+            />
+          )}
+          {activePage === 'history' && (
+            <HistoryPage
+              key="history"
+              runs={runs}
+              runEvents={runEvents}
+              selectedRunId={selectedRunId}
+              selectRun={runId => {
+                setSelectedRunId(runId)
+                fetchRunEvents(runId)
+              }}
             />
           )}
           {activePage === 'personalise' && (
@@ -527,6 +578,72 @@ function ShortlistPage({ items, patchItem }){
   )
 }
 
+function HistoryPage({ runs, runEvents, selectedRunId, selectRun }){
+  const selectedRun = runs.find(run => run.id === selectedRunId)
+
+  return (
+    <PageShell className="wide-page">
+      <PageHeader
+        title="run history"
+        description="A trace of what the discovery agent searched, what it accepted, and why lower-signal results were rejected."
+      />
+      {runs.length > 0 ? (
+        <div className="history-layout">
+          <div className="run-list" aria-label="Discovery runs">
+            {runs.map(run => (
+              <button
+                className={`run-card ${run.id === selectedRunId ? 'active' : ''}`}
+                key={run.id}
+                onClick={() => selectRun(run.id)}
+              >
+                <span>{formatDate(run.started_at)}</span>
+                <strong>{run.status}</strong>
+                <small>{run.accepted_count} accepted / {run.rejected_count} rejected</small>
+              </button>
+            ))}
+          </div>
+          <div className="event-panel">
+            <div className="event-panel-head">
+              <span>{selectedRun ? selectedRun.summary : 'select a run'}</span>
+              {selectedRun && (
+                <small>
+                  {selectedRun.query_count} queries / {selectedRun.source_count} searches / {selectedRun.candidate_count} candidates
+                </small>
+              )}
+            </div>
+            <div className="event-list">
+              {runEvents.length > 0 ? runEvents.map(event => (
+                <div className={`event-row ${event.status}`} key={event.id}>
+                  <div>
+                    <span className="event-status">{event.status.replace('_', ' ')}</span>
+                    <strong>{event.item_title || event.query || event.source}</strong>
+                    <p>{event.reason || 'No reason recorded.'}</p>
+                  </div>
+                  <div className="event-meta">
+                    {event.score ? <span>{Number(event.score).toFixed(1)}</span> : null}
+                    {event.url && <a href={event.url} target="_blank" rel="noreferrer">source</a>}
+                    {event.item_link && <a href={event.item_link} target="_blank" rel="noreferrer">item</a>}
+                  </div>
+                </div>
+              )) : (
+                <div className="empty-state compact">
+                  <span>no event trace yet</span>
+                  <p>Run the discovery agent once and the search trace will appear here.</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="empty-state">
+          <span>no runs recorded</span>
+          <p>The next scheduled or manual briefing run will create a searchable history entry.</p>
+        </div>
+      )}
+    </PageShell>
+  )
+}
+
 function ActivityRow({ item, index, patchItem }){
   const feedbackOptions = ['good', 'neutral', 'bad']
   const host = getLinkHost(item.link)
@@ -569,6 +686,20 @@ function ActivityRow({ item, index, patchItem }){
       </div>
     </div>
   )
+}
+
+function formatDate(value){
+  if(!value) return 'unknown time'
+  try {
+    return new Intl.DateTimeFormat('en', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(value))
+  } catch {
+    return value
+  }
 }
 
 function getLinkHost(link){
@@ -763,16 +894,13 @@ function SettingsPage({ interests, settings, updateSetting }){
           />
         </SettingLine>
         <SettingLine label="discovery mode">
-          <select
-            className="setting-input select"
+          <CustomDropdown
             value={settings.discoveryMode}
-            onChange={event => updateSetting('discoveryMode', event.target.value)}
-          >
-            <option value="precise">precise</option>
-            <option value="balanced">balanced</option>
-            <option value="wide">wide net</option>
-          </select>
+            options={DISCOVERY_MODE_OPTIONS}
+            onChange={value => updateSetting('discoveryMode', value)}
+          />
         </SettingLine>
+        <SettingLine label="email delivery" value="smtp env driven" />
         <SettingLine label="interest signals" value={`${interests.length} saved`} />
         <SettingLine label="testing mode">
           <button

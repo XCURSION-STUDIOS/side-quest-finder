@@ -1,10 +1,10 @@
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote_plus, urljoin
 
 import httpx
-from bs4 import BeautifulSoup
+
+from .llm import LLMExtractor
+from .source_scrapers import SOURCE_SCRAPERS
 
 
 DEFAULT_SETTINGS = {
@@ -36,30 +36,6 @@ PURPOSE_TERMS = {
     "give_back": ["volunteer", "charity", "mutual aid", "community service"],
     "learn": ["class", "course", "workshop", "skill", "beginner"],
 }
-
-SOURCE_TEMPLATES = [
-    {
-        "name": "meetup",
-        "url": "https://www.meetup.com/find/?keywords={query}&location={location}",
-    },
-    {
-        "name": "eventbrite",
-        "url": "https://www.eventbrite.com/d/{location_slug}/{query_slug}/",
-    },
-    {
-        "name": "reddit",
-        "url": "https://www.reddit.com/search/?q={query}%20{location}",
-    },
-    {
-        "name": "peatix",
-        "url": "https://peatix.com/search?q={query}&country={country}",
-    },
-    {
-        "name": "timeout",
-        "url": "https://www.timeout.com/{location_slug}/search?q={query}",
-    },
-]
-
 
 @dataclass
 class DiscoveryContext:
@@ -102,6 +78,7 @@ class DiscoveryContext:
 class DiscoveryAgent:
     def __init__(self, context: DiscoveryContext):
         self.context = context
+        self.events = []
 
     def build_queries(self) -> List[str]:
         base_terms = self.context.interests or ["clubs", "communities", "activities"]
@@ -126,28 +103,15 @@ class DiscoveryAgent:
         return dedupe(queries)[:12]
 
     def build_source_urls(self) -> List[Dict[str, str]]:
-        urls = []
-        location = self.context.location_name
-        location_slug = slug(location)
-        country = self.context.location_code.lower()
-
+        searches = []
         for query in self.build_queries():
-            for template in SOURCE_TEMPLATES:
-                if template["name"] not in self.context.enabled_sources:
+            for source_name in self.context.enabled_sources:
+                scraper = SOURCE_SCRAPERS.get(source_name)
+                if not scraper:
                     continue
-                urls.append({
-                    "source": template["name"],
-                    "query": query,
-                    "url": template["url"].format(
-                        query=quote_plus(query),
-                        query_slug=slug(query),
-                        location=quote_plus(location),
-                        location_slug=location_slug,
-                        country=country,
-                    ),
-                })
+                searches.extend(scraper.build_searches(query, self.context.location_name, self.context.location_code))
 
-        return urls
+        return [{"source": search.source, "query": search.query, "url": search.url, "search": search} for search in searches]
 
     async def run(self) -> List[Dict[str, Any]]:
         candidates = []
@@ -160,19 +124,70 @@ class DiscoveryAgent:
             headers={"User-Agent": "XCursionStudiosBot/0.1 (+local prototype)"},
         ) as client:
             for source in source_urls[:per_run_limit]:
-                candidates.extend(await self.scrape_source(client, source))
+                scraped = await self.scrape_source(client, source)
+                candidates.extend(scraped)
 
         scored = [self.score_candidate(candidate) for candidate in candidates]
+        scored = await LLMExtractor().refine_candidates(scored, {
+            "interests": self.context.interests,
+            "focus": self.context.focus,
+            "settings": self.context.settings,
+        })
+        scored = [self.score_candidate(candidate) for candidate in scored]
         scored = [candidate for candidate in scored if candidate["score"] > 0]
         scored = sorted(scored, key=lambda candidate: candidate["score"], reverse=True)
 
-        return dedupe_candidates(scored)[: self.context.max_finds]
+        accepted = dedupe_candidates(scored)[: self.context.max_finds]
+        accepted_keys = {(item.get("title", "").lower(), item.get("link", "")) for item in accepted}
+        for candidate in candidates:
+            key = (candidate.get("title", "").lower(), candidate.get("link", ""))
+            accepted_candidate = key in accepted_keys
+            self.events.append({
+                "source": candidate.get("source"),
+                "query": candidate.get("tags"),
+                "url": (candidate.get("metadata") or {}).get("source_url"),
+                "status": "accepted" if accepted_candidate else "rejected",
+                "reason": build_acceptance_reason(candidate, accepted_candidate),
+                "item_title": candidate.get("title"),
+                "item_link": candidate.get("link"),
+                "score": candidate.get("score", 0),
+                "metadata": candidate.get("metadata") or {},
+            })
+
+        return accepted
 
     async def scrape_source(self, client: httpx.AsyncClient, source: Dict[str, str]) -> List[Dict[str, Any]]:
+        scraper = SOURCE_SCRAPERS.get(source["source"])
+        self.events.append({
+            "source": source["source"],
+            "query": source["query"],
+            "url": source["url"],
+            "status": "searched",
+            "reason": "source-specific scraper scheduled",
+            "metadata": {},
+        })
+        if not scraper:
+            return []
         try:
-            response = await client.get(source["url"])
-            response.raise_for_status()
+            results = await scraper.scrape(client, source["search"], self.context.location_name)
+            self.events.append({
+                "source": source["source"],
+                "query": source["query"],
+                "url": source["url"],
+                "status": "candidates_found",
+                "reason": f"{len(results)} raw candidates extracted",
+                "metadata": {"count": len(results)},
+            })
+            return results
         except Exception as exc:
+            self.events.append({
+                "source": source["source"],
+                "query": source["query"],
+                "url": source["url"],
+                "status": "source_error",
+                "reason": str(exc)[:240],
+                "metadata": {},
+            })
             return [{
                 "title": f"{source['source']} search unavailable for {source['query']}",
                 "link": source["url"],
@@ -182,32 +197,6 @@ class DiscoveryAgent:
                 "metadata": {"status": "source_error", "query": source["query"]},
                 "score": 0,
             }]
-
-        soup = BeautifulSoup(response.text, "lxml")
-        results = []
-        for anchor in soup.find_all("a")[:80]:
-            title = clean_text(anchor.get_text(" ", strip=True))
-            href = anchor.get("href")
-            if not title or len(title) < 8 or not href:
-                continue
-
-            link = urljoin(source["url"], href)
-            nearby = clean_text(anchor.parent.get_text(" ", strip=True) if anchor.parent else "")
-            results.append({
-                "title": title[:180],
-                "link": link,
-                "source": source["source"],
-                "summary": nearby[:320] if nearby and nearby != title else None,
-                "tags": source["query"],
-                "activity_when": extract_when(nearby),
-                "venue": None,
-                "location": self.context.location_name,
-                "contact": None,
-                "metadata": {"query": source["query"], "source_url": source["url"]},
-                "score": 0,
-            })
-
-        return results
 
     def score_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         text = " ".join(filter(None, [
@@ -256,10 +245,6 @@ def clean_text(value: Optional[str]) -> str:
     return " ".join((value or "").split())
 
 
-def slug(value: str) -> str:
-    return quote_plus(value.strip().lower().replace(" ", "-"))
-
-
 def dedupe(values: List[str]) -> List[str]:
     seen = set()
     output = []
@@ -284,14 +269,12 @@ def dedupe_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return output
 
 
-def extract_when(text: Optional[str]) -> Optional[str]:
-    text = clean_text(text)
-    if not text:
-        return None
-
-    markers = ["today", "tomorrow", "sat", "sun", "mon", "tue", "wed", "thu", "fri", "2026"]
-    lowered = text.lower()
-    if not any(marker in lowered for marker in markers):
-        return None
-
-    return text[:120]
+def build_acceptance_reason(candidate: Dict[str, Any], accepted: bool) -> str:
+    metadata = candidate.get("metadata") or {}
+    if metadata.get("llm_reason"):
+        return metadata["llm_reason"]
+    if accepted:
+        return "high enough score after interest, focus, source, and feedback weighting"
+    if candidate.get("score", 0) <= 0:
+        return "filtered out by low score or quality rules"
+    return "not selected because higher-ranked candidates filled the daily limit"

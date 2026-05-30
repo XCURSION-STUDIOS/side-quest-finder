@@ -1,11 +1,13 @@
 from apscheduler.schedulers.background import BackgroundScheduler
-from .agent import DEFAULT_SETTINGS, DiscoveryAgent, DiscoveryContext
-from .db import engine
-from .models import Item, Preference
-from sqlmodel import Session, select
 from datetime import datetime
 
-def run_scrape_job():
+from .agent import DEFAULT_SETTINGS, DiscoveryAgent, DiscoveryContext
+from .db import engine
+from .models import DiscoveryRun, DiscoveryRunEvent, Item, Preference
+from .notifications import send_daily_email
+from sqlmodel import Session, select
+
+def run_scrape_job(force: bool = False):
     import asyncio
 
     async def _run():
@@ -15,8 +17,16 @@ def run_scrape_job():
             focus = pref.get_focus() if pref else []
             settings = {**DEFAULT_SETTINGS, **(pref.get_settings() if pref else {})}
 
-        if not settings.get("dailySummary", True):
+        if not force and not settings.get("dailySummary", True):
             return
+
+        run = DiscoveryRun(status="running")
+        run.set_settings(settings)
+        with Session(engine) as session:
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            run_id = run.id
 
         feedback_profile = build_feedback_profile()
         agent = DiscoveryAgent(DiscoveryContext(
@@ -25,8 +35,17 @@ def run_scrape_job():
             settings=settings,
             feedback_profile=feedback_profile,
         ))
-        items = await agent.run()
+        try:
+            items = await agent.run()
+            status = "completed"
+            summary = f"Accepted {len(items)} activity leads."
+        except Exception as exc:
+            items = []
+            status = "failed"
+            summary = str(exc)[:240]
+
         with Session(engine) as session:
+            accepted_count = 0
             for it in items:
                 stmt = select(Item).where(Item.title == it.get("title"), Item.link == it.get("link"))
                 found = session.exec(stmt).first()
@@ -46,7 +65,37 @@ def run_scrape_job():
                 )
                 obj.set_metadata(it.get("metadata") or {})
                 session.add(obj)
+                accepted_count += 1
+
+            for event in agent.events:
+                run_event = DiscoveryRunEvent(
+                    run_id=run_id,
+                    source=event.get("source"),
+                    query=event.get("query"),
+                    url=event.get("url"),
+                    status=event.get("status"),
+                    reason=event.get("reason"),
+                    item_title=event.get("item_title"),
+                    item_link=event.get("item_link"),
+                    score=event.get("score", 0),
+                )
+                run_event.set_metadata(event.get("metadata") or {})
+                session.add(run_event)
+
+            run = session.get(DiscoveryRun, run_id)
+            run.completed_at = datetime.utcnow()
+            run.status = status
+            run.query_count = len(agent.build_queries())
+            run.source_count = len(agent.build_source_urls())
+            run.candidate_count = len([event for event in agent.events if event.get("status") in {"accepted", "rejected"}])
+            run.accepted_count = len([event for event in agent.events if event.get("status") == "accepted"])
+            run.rejected_count = len([event for event in agent.events if event.get("status") == "rejected"])
+            run.summary = summary
+            session.add(run)
             session.commit()
+
+        if status == "completed":
+            send_daily_email(items)
 
     asyncio.run(_run())
 

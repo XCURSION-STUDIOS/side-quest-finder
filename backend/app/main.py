@@ -2,10 +2,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 from .db import create_db_and_tables, engine
-from .models import Preference, Item
+from .models import DiscoveryRun, DiscoveryRunEvent, Preference, Item
 from .utils import generate_daily_summary, get_demo_items
 from .scheduler import start_scheduler, run_scrape_job
 from .agent import DEFAULT_SETTINGS
+from .connectors import connector_status
 
 app = FastAPI(title="Side Quest Finder Agent")
 
@@ -149,11 +150,67 @@ def update_item(item_id: int, payload: dict):
 
 @app.post("/run-scrape")
 def run_scrape():
-    run_scrape_job()
+    run_scrape_job(force=True)
     return {"ok": True}
 
 
 @app.post("/discovery/run")
 def run_discovery():
-    run_scrape_job()
+    run_scrape_job(force=True)
     return daily_summary()
+
+
+@app.get("/discovery/runs")
+def get_discovery_runs():
+    with Session(engine) as session:
+        runs = session.exec(select(DiscoveryRun)).all()
+    runs = sorted(runs, key=lambda run: run.started_at, reverse=True)[:20]
+    return {
+        "runs": [
+            {
+                "id": run.id,
+                "started_at": run.started_at.isoformat(),
+                "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+                "status": run.status,
+                "query_count": run.query_count,
+                "source_count": run.source_count,
+                "candidate_count": run.candidate_count,
+                "accepted_count": run.accepted_count,
+                "rejected_count": run.rejected_count,
+                "summary": run.summary,
+            }
+            for run in runs
+        ]
+    }
+
+
+@app.get("/discovery/runs/{run_id}/events")
+def get_discovery_run_events(run_id: int):
+    with Session(engine) as session:
+        run = session.get(DiscoveryRun, run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="run not found")
+        events = session.exec(select(DiscoveryRunEvent).where(DiscoveryRunEvent.run_id == run_id)).all()
+    events = sorted(events, key=lambda event: event.created_at)
+    return {
+        "events": [
+            {
+                "id": event.id,
+                "created_at": event.created_at.isoformat(),
+                "source": event.source,
+                "query": event.query,
+                "url": event.url,
+                "status": event.status,
+                "reason": event.reason,
+                "item_title": event.item_title,
+                "item_link": event.item_link,
+                "score": event.score,
+            }
+            for event in events
+        ]
+    }
+
+
+@app.get("/connectors")
+def get_connectors():
+    return connector_status()
