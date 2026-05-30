@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
+from bs4 import BeautifulSoup
 
 from .llm import LLMExtractor
 from .llm_brain import LLMAgentBrain
@@ -81,6 +82,8 @@ class DiscoveryAgent:
         self.context = context
         self.events = []
         self.query_plan = None
+        self.candidate_counter = 0
+        self.opened_candidate_ids = set()
 
     def build_fallback_queries(self) -> List[str]:
         base_terms = self.context.interests or ["clubs", "communities", "activities"]
@@ -180,6 +183,16 @@ class DiscoveryAgent:
                     self.available_sources(),
                     query_plan,
                 )
+                if action["action"] == "open_result":
+                    opened = await self.open_result(client, candidates, action, step + 1)
+                    observations.append({
+                        "step": step + 1,
+                        "tool": "open_result",
+                        "candidate_id": action.get("candidate_id"),
+                        "opened": opened,
+                    })
+                    continue
+
                 if action["action"] != "search_source":
                     self.events.append({
                         "status": "agent_stop",
@@ -213,6 +226,7 @@ class DiscoveryAgent:
                 before_count = len(candidates)
                 for source in search_items:
                     scraped = await self.scrape_source(client, source)
+                    self.assign_candidate_ids(scraped)
                     candidates.extend(scraped)
                 found_count = len(candidates) - before_count
                 observations.append({
@@ -230,6 +244,79 @@ class DiscoveryAgent:
                     break
 
         return candidates
+
+    async def open_result(self, client: httpx.AsyncClient, candidates: List[Dict[str, Any]], action: Dict[str, Any], step: int) -> bool:
+        candidate = self.find_candidate(candidates, action.get("candidate_id"), action.get("url"))
+        if not candidate:
+            self.events.append({
+                "status": "open_error",
+                "reason": "Agent tried to open a candidate that is no longer available.",
+                "url": action.get("url"),
+                "metadata": {"step": step, "candidate_id": action.get("candidate_id")},
+            })
+            return False
+
+        candidate_id = candidate.get("_agent_id")
+        if candidate_id in self.opened_candidate_ids:
+            self.events.append({
+                "source": candidate.get("source"),
+                "status": "open_skipped",
+                "reason": "Candidate already opened during this run.",
+                "item_title": candidate.get("title"),
+                "item_link": candidate.get("link"),
+                "metadata": {"step": step, "candidate_id": candidate_id},
+            })
+            return False
+
+        url = candidate.get("link")
+        self.events.append({
+            "source": candidate.get("source"),
+            "query": candidate.get("tags"),
+            "url": url,
+            "status": "agent_action",
+            "reason": action.get("reason"),
+            "item_title": candidate.get("title"),
+            "item_link": url,
+            "metadata": {"step": step, "tool": "open_result", "candidate_id": candidate_id},
+        })
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            page_text = extract_page_text(response.text)
+        except Exception as exc:
+            self.events.append({
+                "source": candidate.get("source"),
+                "query": candidate.get("tags"),
+                "url": url,
+                "status": "open_error",
+                "reason": str(exc)[:240],
+                "item_title": candidate.get("title"),
+                "item_link": url,
+                "metadata": {"step": step, "candidate_id": candidate_id},
+            })
+            self.opened_candidate_ids.add(candidate_id)
+            return False
+
+        metadata = candidate.get("metadata") or {}
+        metadata["opened_url"] = url
+        metadata["opened_page_excerpt"] = page_text[:5000]
+        metadata["opened_page_chars"] = len(page_text)
+        candidate["metadata"] = metadata
+        if page_text and not candidate.get("summary"):
+            candidate["summary"] = page_text[:420]
+
+        self.opened_candidate_ids.add(candidate_id)
+        self.events.append({
+            "source": candidate.get("source"),
+            "query": candidate.get("tags"),
+            "url": url,
+            "status": "opened_result",
+            "reason": f"Opened result page and captured {len(page_text)} text characters.",
+            "item_title": candidate.get("title"),
+            "item_link": url,
+            "metadata": {"step": step, "candidate_id": candidate_id, "page_chars": len(page_text)},
+        })
+        return True
 
     async def finalize_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         scored = [self.score_candidate(candidate) for candidate in candidates]
@@ -278,6 +365,25 @@ class DiscoveryAgent:
         searches = scraper.build_searches(query, self.context.location_name, self.context.location_code)
         return [{"source": search.source, "query": search.query, "url": search.url, "search": search} for search in searches]
 
+    def assign_candidate_ids(self, candidates: List[Dict[str, Any]]):
+        for candidate in candidates:
+            if candidate.get("_agent_id"):
+                continue
+            self.candidate_counter += 1
+            candidate_id = f"cand-{self.candidate_counter}"
+            candidate["_agent_id"] = candidate_id
+            metadata = candidate.get("metadata") or {}
+            metadata["agent_candidate_id"] = candidate_id
+            candidate["metadata"] = metadata
+
+    def find_candidate(self, candidates: List[Dict[str, Any]], candidate_id: Optional[str], url: Optional[str]):
+        for candidate in candidates:
+            if candidate_id and candidate.get("_agent_id") == candidate_id:
+                return candidate
+            if url and candidate.get("link") == url:
+                return candidate
+        return None
+
     def next_unsearched_action(self, query_plan: List[Dict[str, Any]], searched_pairs: set) -> Optional[Dict[str, str]]:
         for entry in query_plan:
             query = entry["query"]
@@ -303,7 +409,20 @@ class DiscoveryAgent:
             "candidate_count": len(candidates),
             "accepted_target": self.context.max_finds,
             "searched_pairs": [f"{source}:{query}" for source, query in sorted(searched_pairs)][-24:],
+            "opened_candidate_ids": sorted(self.opened_candidate_ids)[-24:],
             "recent_observations": observations[-8:],
+            "openable_candidates": [
+                {
+                    "id": candidate.get("_agent_id"),
+                    "title": candidate.get("title"),
+                    "source": candidate.get("source"),
+                    "url": candidate.get("link"),
+                    "summary": candidate.get("summary"),
+                    "score": candidate.get("score"),
+                }
+                for candidate in top_candidates
+                if candidate.get("_agent_id") and candidate.get("_agent_id") not in self.opened_candidate_ids
+            ][:8],
             "top_candidate_snapshots": [
                 {
                     "title": candidate.get("title"),
@@ -448,3 +567,11 @@ def build_acceptance_reason(candidate: Dict[str, Any], accepted: bool) -> str:
     if candidate.get("score", 0) <= 0:
         return "filtered out by low score or quality rules"
     return "not selected because higher-ranked candidates filled the daily limit"
+
+
+def extract_page_text(html: str) -> str:
+    soup = BeautifulSoup(html or "", "lxml")
+    for element in soup(["script", "style", "noscript", "svg"]):
+        element.decompose()
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    return clean_text(main.get_text(" ", strip=True))[:12000]

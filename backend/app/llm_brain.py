@@ -52,12 +52,14 @@ ACTION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "action": {"type": "string", "enum": ["search_source", "stop"]},
+        "action": {"type": "string", "enum": ["search_source", "open_result", "stop"]},
         "source": {"type": ["string", "null"]},
         "query": {"type": ["string", "null"]},
+        "candidate_id": {"type": ["string", "null"]},
+        "url": {"type": ["string", "null"]},
         "reason": {"type": "string"},
     },
-    "required": ["action", "source", "query", "reason"],
+    "required": ["action", "source", "query", "candidate_id", "url", "reason"],
 }
 
 
@@ -168,7 +170,7 @@ class LLMAgentBrain:
         query_plan: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         if not self.enabled:
-            return {"action": "stop", "source": None, "query": None, "reason": "LLM action loop unavailable"}
+            return {"action": "stop", "source": None, "query": None, "candidate_id": None, "url": None, "reason": "LLM action loop unavailable"}
 
         prompt = {
             "user_context": context,
@@ -177,10 +179,11 @@ class LLMAgentBrain:
             "query_plan": query_plan,
             "instruction": (
                 "Choose exactly one next action for the discovery agent. Use search_source when another "
-                "targeted search is likely to improve the results. Use stop when enough promising candidates "
-                "have been found, the budget is nearly spent, or remaining searches look repetitive. Avoid "
-                "repeating source/query pairs from searched_pairs. Prefer sources and queries that fit the "
-                "user's goals and fill gaps in current candidates."
+                "targeted search is likely to improve the result pool. Use open_result when an unopened "
+                "candidate looks promising and inspecting the page could confirm date, venue, contact, or "
+                "quality. Use stop when enough promising candidates have been inspected/found, the budget is "
+                "nearly spent, or remaining actions look repetitive. Avoid repeating searched_pairs and avoid "
+                "opening candidate ids listed in opened_candidate_ids."
             ),
         }
         try:
@@ -191,19 +194,34 @@ class LLMAgentBrain:
                 prompt=prompt,
             )
         except Exception as exc:
-            return {"action": "stop", "source": None, "query": None, "reason": f"LLM action choice failed: {str(exc)[:160]}"}
+            return {"action": "stop", "source": None, "query": None, "candidate_id": None, "url": None, "reason": f"LLM action choice failed: {str(exc)[:160]}"}
 
         action = data.get("action")
         source = data.get("source")
         query = data.get("query")
+        candidate_id = data.get("candidate_id")
+        url = data.get("url")
+        if action == "open_result":
+            if not candidate_id and not url:
+                return {"action": "stop", "source": None, "query": None, "candidate_id": None, "url": None, "reason": "LLM chose open_result without a candidate"}
+            return {
+                "action": "open_result",
+                "source": None,
+                "query": None,
+                "candidate_id": str(candidate_id) if candidate_id else None,
+                "url": str(url) if url else None,
+                "reason": str(data.get("reason") or "LLM selected a result to inspect")[:240],
+            }
         if action != "search_source":
-            return {"action": "stop", "source": None, "query": None, "reason": data.get("reason") or "LLM chose to stop"}
+            return {"action": "stop", "source": None, "query": None, "candidate_id": None, "url": None, "reason": data.get("reason") or "LLM chose to stop"}
         if source not in enabled_sources or not query:
-            return {"action": "stop", "source": None, "query": None, "reason": "LLM chose an unavailable source or empty query"}
+            return {"action": "stop", "source": None, "query": None, "candidate_id": None, "url": None, "reason": "LLM chose an unavailable source or empty query"}
         return {
             "action": "search_source",
             "source": str(source),
             "query": " ".join(str(query).split())[:140],
+            "candidate_id": None,
+            "url": None,
             "reason": str(data.get("reason") or "LLM selected next source/query")[:240],
         }
 

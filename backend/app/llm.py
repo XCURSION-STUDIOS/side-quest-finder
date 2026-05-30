@@ -44,7 +44,11 @@ class LLMExtractor:
         prompt = {
             "candidate": candidate,
             "user_context": context,
-            "instruction": "Extract a clean activity card. Reject navigation pages, cookie pages, ads, logins, and vague non-events.",
+            "instruction": (
+                "Extract a clean activity card. If candidate.metadata.opened_page_excerpt exists, use it as "
+                "the inspected result page and prefer it over search-result snippets for date, venue, contact, "
+                "summary, and quality. Reject navigation pages, cookie pages, ads, logins, stale pages, and vague non-events."
+            ),
         }
         try:
             response = await client.post(
