@@ -137,6 +137,15 @@ class DiscoveryAgent:
         return [{"source": search.source, "query": search.query, "url": search.url, "search": search} for search in searches]
 
     async def run(self) -> List[Dict[str, Any]]:
+        brain = LLMAgentBrain()
+        if brain.enabled:
+            candidates = await self.run_agentic_search(brain)
+        else:
+            candidates = await self.run_fixed_search()
+
+        return await self.finalize_candidates(candidates)
+
+    async def run_fixed_search(self) -> List[Dict[str, Any]]:
         candidates = []
         source_urls = await self.build_source_urls()
         per_run_limit = 70 if self.context.discovery_mode == "wide" else 45
@@ -150,6 +159,79 @@ class DiscoveryAgent:
                 scraped = await self.scrape_source(client, source)
                 candidates.extend(scraped)
 
+        return candidates
+
+    async def run_agentic_search(self, brain: LLMAgentBrain) -> List[Dict[str, Any]]:
+        candidates = []
+        query_plan = self.query_plan or await self.build_query_plan()
+        searched_pairs = set()
+        observations = []
+        max_tool_calls = self.tool_budget()
+
+        async with httpx.AsyncClient(
+            timeout=20,
+            follow_redirects=True,
+            headers={"User-Agent": "XCursionStudiosBot/0.1 (+local prototype)"},
+        ) as client:
+            for step in range(max_tool_calls):
+                action = await brain.choose_action(
+                    self.llm_context(),
+                    self.agent_state(candidates, observations, searched_pairs, step, max_tool_calls),
+                    self.available_sources(),
+                    query_plan,
+                )
+                if action["action"] != "search_source":
+                    self.events.append({
+                        "status": "agent_stop",
+                        "reason": action.get("reason"),
+                        "metadata": {"step": step, "candidate_count": len(candidates)},
+                    })
+                    break
+
+                pair = (action["source"], action["query"].lower())
+                if pair in searched_pairs:
+                    fallback = self.next_unsearched_action(query_plan, searched_pairs)
+                    if not fallback:
+                        self.events.append({
+                            "status": "agent_stop",
+                            "reason": "No unsearched source/query pairs remain.",
+                            "metadata": {"step": step, "candidate_count": len(candidates)},
+                        })
+                        break
+                    action = fallback
+                    pair = (action["source"], action["query"].lower())
+
+                searched_pairs.add(pair)
+                self.events.append({
+                    "source": action["source"],
+                    "query": action["query"],
+                    "status": "agent_action",
+                    "reason": action.get("reason"),
+                    "metadata": {"step": step + 1, "tool": "search_source"},
+                })
+                search_items = self.source_searches(action["source"], action["query"])
+                before_count = len(candidates)
+                for source in search_items:
+                    scraped = await self.scrape_source(client, source)
+                    candidates.extend(scraped)
+                found_count = len(candidates) - before_count
+                observations.append({
+                    "step": step + 1,
+                    "source": action["source"],
+                    "query": action["query"],
+                    "found": found_count,
+                })
+                if len(candidates) >= self.context.max_finds * 6 and step >= 4:
+                    self.events.append({
+                        "status": "agent_stop",
+                        "reason": "Candidate budget reached; moving to extraction and ranking.",
+                        "metadata": {"step": step + 1, "candidate_count": len(candidates)},
+                    })
+                    break
+
+        return candidates
+
+    async def finalize_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         scored = [self.score_candidate(candidate) for candidate in candidates]
         scored = await LLMExtractor().refine_candidates(scored, {
             **self.llm_context(),
@@ -178,6 +260,60 @@ class DiscoveryAgent:
             })
 
         return accepted
+
+    def tool_budget(self) -> int:
+        if self.context.discovery_mode == "wide":
+            return 18
+        if self.context.discovery_mode == "precise":
+            return 8
+        return 12
+
+    def available_sources(self) -> List[str]:
+        return [source for source in self.context.enabled_sources if source in SOURCE_SCRAPERS]
+
+    def source_searches(self, source_name: str, query: str) -> List[Dict[str, str]]:
+        scraper = SOURCE_SCRAPERS.get(source_name)
+        if not scraper:
+            return []
+        searches = scraper.build_searches(query, self.context.location_name, self.context.location_code)
+        return [{"source": search.source, "query": search.query, "url": search.url, "search": search} for search in searches]
+
+    def next_unsearched_action(self, query_plan: List[Dict[str, Any]], searched_pairs: set) -> Optional[Dict[str, str]]:
+        for entry in query_plan:
+            query = entry["query"]
+            for source in self.available_sources():
+                if (source, query.lower()) not in searched_pairs:
+                    return {
+                        "action": "search_source",
+                        "source": source,
+                        "query": query,
+                        "reason": "Fallback selected the next unsearched planned query.",
+                    }
+        return None
+
+    def agent_state(self, candidates, observations, searched_pairs, step, max_tool_calls) -> Dict[str, Any]:
+        top_candidates = sorted(
+            [self.score_candidate(dict(candidate)) for candidate in candidates[-30:]],
+            key=lambda candidate: candidate.get("score", 0),
+            reverse=True,
+        )[:8]
+        return {
+            "step": step + 1,
+            "max_tool_calls": max_tool_calls,
+            "candidate_count": len(candidates),
+            "accepted_target": self.context.max_finds,
+            "searched_pairs": [f"{source}:{query}" for source, query in sorted(searched_pairs)][-24:],
+            "recent_observations": observations[-8:],
+            "top_candidate_snapshots": [
+                {
+                    "title": candidate.get("title"),
+                    "source": candidate.get("source"),
+                    "tags": candidate.get("tags"),
+                    "score": candidate.get("score"),
+                }
+                for candidate in top_candidates
+            ],
+        }
 
     def llm_context(self) -> Dict[str, Any]:
         return {

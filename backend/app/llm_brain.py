@@ -48,6 +48,18 @@ RANKING_SCHEMA = {
     "required": ["decisions"],
 }
 
+ACTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "action": {"type": "string", "enum": ["search_source", "stop"]},
+        "source": {"type": ["string", "null"]},
+        "query": {"type": ["string", "null"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["action", "source", "query", "reason"],
+}
+
 
 class LLMAgentBrain:
     def __init__(self):
@@ -147,6 +159,53 @@ class LLMAgentBrain:
             if not decision["accept"]:
                 candidate["score"] = 0
         return candidates
+
+    async def choose_action(
+        self,
+        context: Dict[str, Any],
+        state: Dict[str, Any],
+        enabled_sources: List[str],
+        query_plan: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"action": "stop", "source": None, "query": None, "reason": "LLM action loop unavailable"}
+
+        prompt = {
+            "user_context": context,
+            "state": state,
+            "enabled_sources": enabled_sources,
+            "query_plan": query_plan,
+            "instruction": (
+                "Choose exactly one next action for the discovery agent. Use search_source when another "
+                "targeted search is likely to improve the results. Use stop when enough promising candidates "
+                "have been found, the budget is nearly spent, or remaining searches look repetitive. Avoid "
+                "repeating source/query pairs from searched_pairs. Prefer sources and queries that fit the "
+                "user's goals and fill gaps in current candidates."
+            ),
+        }
+        try:
+            data = await self.request_schema(
+                name="agent_action",
+                schema=ACTION_SCHEMA,
+                system_prompt="You control one step of a local discovery agent. Return only valid JSON.",
+                prompt=prompt,
+            )
+        except Exception as exc:
+            return {"action": "stop", "source": None, "query": None, "reason": f"LLM action choice failed: {str(exc)[:160]}"}
+
+        action = data.get("action")
+        source = data.get("source")
+        query = data.get("query")
+        if action != "search_source":
+            return {"action": "stop", "source": None, "query": None, "reason": data.get("reason") or "LLM chose to stop"}
+        if source not in enabled_sources or not query:
+            return {"action": "stop", "source": None, "query": None, "reason": "LLM chose an unavailable source or empty query"}
+        return {
+            "action": "search_source",
+            "source": str(source),
+            "query": " ".join(str(query).split())[:140],
+            "reason": str(data.get("reason") or "LLM selected next source/query")[:240],
+        }
 
     async def request_schema(self, name: str, schema: Dict[str, Any], system_prompt: str, prompt: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=35) as client:
