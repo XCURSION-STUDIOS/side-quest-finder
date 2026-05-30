@@ -86,7 +86,7 @@ def run_scrape_job(force: bool = False):
             run.completed_at = datetime.utcnow()
             run.status = status
             run.query_count = len(agent.build_queries())
-            run.source_count = len(agent.build_source_urls())
+            run.source_count = len([event for event in agent.events if event.get("status") == "searched"])
             run.candidate_count = len([event for event in agent.events if event.get("status") in {"accepted", "rejected"}])
             run.accepted_count = len([event for event in agent.events if event.get("status") == "accepted"])
             run.rejected_count = len([event for event in agent.events if event.get("status") == "rejected"])

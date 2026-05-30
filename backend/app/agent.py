@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from .llm import LLMExtractor
+from .llm_brain import LLMAgentBrain
 from .source_scrapers import SOURCE_SCRAPERS
 
 
@@ -28,7 +29,7 @@ COUNTRY_NAMES = {
     "CA": "Canada",
 }
 
-PURPOSE_TERMS = {
+FALLBACK_PURPOSE_TERMS = {
     "make_friends": ["social", "community", "new friends", "club", "group"],
     "dating": ["singles", "social mixer", "dating", "speed dating"],
     "fitness": ["training", "run", "fitness", "sports", "workout"],
@@ -79,15 +80,16 @@ class DiscoveryAgent:
     def __init__(self, context: DiscoveryContext):
         self.context = context
         self.events = []
+        self.query_plan = None
 
-    def build_queries(self) -> List[str]:
+    def build_fallback_queries(self) -> List[str]:
         base_terms = self.context.interests or ["clubs", "communities", "activities"]
         purpose_terms = []
         for focus in self.context.focus:
-            purpose_terms.extend(PURPOSE_TERMS.get(focus, []))
+            purpose_terms.extend(FALLBACK_PURPOSE_TERMS.get(focus, []))
 
         if not purpose_terms:
-            purpose_terms = PURPOSE_TERMS["make_friends"][:2]
+            purpose_terms = FALLBACK_PURPOSE_TERMS["make_friends"][:2]
 
         queries = []
         for term in base_terms:
@@ -102,9 +104,30 @@ class DiscoveryAgent:
 
         return dedupe(queries)[:12]
 
-    def build_source_urls(self) -> List[Dict[str, str]]:
+    async def build_query_plan(self) -> List[Dict[str, Any]]:
+        fallback_queries = self.build_fallback_queries()
+        brain = LLMAgentBrain()
+        plan = await brain.plan_queries(self.llm_context(), fallback_queries)
+        self.query_plan = plan
+        for entry in plan:
+            self.events.append({
+                "query": entry["query"],
+                "status": "planned_query",
+                "reason": entry.get("reason"),
+                "metadata": {"intent": entry.get("intent"), "llm_enabled": brain.enabled},
+            })
+        return plan
+
+    def build_queries(self) -> List[str]:
+        if self.query_plan:
+            return [entry["query"] for entry in self.query_plan]
+        return self.build_fallback_queries()
+
+    async def build_source_urls(self) -> List[Dict[str, str]]:
         searches = []
-        for query in self.build_queries():
+        query_plan = self.query_plan or await self.build_query_plan()
+        for entry in query_plan:
+            query = entry["query"]
             for source_name in self.context.enabled_sources:
                 scraper = SOURCE_SCRAPERS.get(source_name)
                 if not scraper:
@@ -115,7 +138,7 @@ class DiscoveryAgent:
 
     async def run(self) -> List[Dict[str, Any]]:
         candidates = []
-        source_urls = self.build_source_urls()
+        source_urls = await self.build_source_urls()
         per_run_limit = 70 if self.context.discovery_mode == "wide" else 45
 
         async with httpx.AsyncClient(
@@ -129,11 +152,11 @@ class DiscoveryAgent:
 
         scored = [self.score_candidate(candidate) for candidate in candidates]
         scored = await LLMExtractor().refine_candidates(scored, {
-            "interests": self.context.interests,
-            "focus": self.context.focus,
-            "settings": self.context.settings,
+            **self.llm_context(),
+            "phase": "extract_activity_cards",
         })
         scored = [self.score_candidate(candidate) for candidate in scored]
+        scored = await LLMAgentBrain().rank_candidates(scored, self.llm_context(), self.context.max_finds)
         scored = [candidate for candidate in scored if candidate["score"] > 0]
         scored = sorted(scored, key=lambda candidate: candidate["score"], reverse=True)
 
@@ -155,6 +178,15 @@ class DiscoveryAgent:
             })
 
         return accepted
+
+    def llm_context(self) -> Dict[str, Any]:
+        return {
+            "interests": self.context.interests,
+            "focus": self.context.focus,
+            "settings": self.context.settings,
+            "location": self.context.location_name,
+            "feedback_profile": self.context.feedback_profile or {},
+        }
 
     async def scrape_source(self, client: httpx.AsyncClient, source: Dict[str, str]) -> List[Dict[str, Any]]:
         scraper = SOURCE_SCRAPERS.get(source["source"])
@@ -212,7 +244,7 @@ class DiscoveryAgent:
                 score += 2.5
 
         for focus in self.context.focus:
-            for term in PURPOSE_TERMS.get(focus, []):
+            for term in FALLBACK_PURPOSE_TERMS.get(focus, []):
                 if term.lower() in text:
                     score += 1.0
 
@@ -271,6 +303,8 @@ def dedupe_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def build_acceptance_reason(candidate: Dict[str, Any], accepted: bool) -> str:
     metadata = candidate.get("metadata") or {}
+    if metadata.get("llm_ranking_reason"):
+        return metadata["llm_ranking_reason"]
     if metadata.get("llm_reason"):
         return metadata["llm_reason"]
     if accepted:

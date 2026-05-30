@@ -8,6 +8,13 @@ The backend stores interests, focus/purpose signals, source choices, and agent s
 
 Users can shortlist recommendations and mark each suggestion as good, neutral, or bad. The next discovery runs read that history as a lightweight preference profile, boosting or penalising similar sources and terms over time.
 
+When `OPENAI_API_KEY` is set, the agent uses an LLM as its planning and judgement layer:
+- it turns the user's interests, focus, location, settings, and feedback history into personalised search queries;
+- it extracts clean activity cards from raw scraped candidates;
+- it ranks the whole candidate set comparatively and records why each item was accepted or rejected.
+
+Without an API key, the same pipeline falls back to deterministic query templates and local scoring so the prototype remains runnable offline.
+
 Current source support includes per-source adapters for Meetup, Eventbrite, Reddit, Peatix, and Time Out. Login-gated apps such as Facebook and Instagram are tracked as planned connectors through `GET /connectors`; they should be integrated through official APIs, exports, OAuth, or user-authorised browser automation rather than brittle unauthenticated scraping.
 
 Every run creates a trace available from:
