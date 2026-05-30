@@ -67,7 +67,6 @@ const NAV_ITEMS = [
   { id: 'discover', icon: '>', label: 'discover' },
   { id: 'briefing', icon: '!', label: 'briefing' },
   { id: 'shortlist', icon: '$', label: 'shortlist' },
-  { id: 'history', icon: '~', label: 'history' },
   { id: 'focus', icon: '@', label: 'focus' },
   { id: 'personalise', icon: '+', label: 'personalise' },
   { id: 'sources', icon: '#', label: 'sources' },
@@ -387,7 +386,13 @@ function App(){
             <SourcesPage key="sources" settings={settings} updateSetting={updateSetting} />
           )}
           {activePage === 'settings' && (
-            <SettingsPage key="settings" interests={interests} settings={settings} updateSetting={updateSetting} />
+            <SettingsPage
+              key="settings"
+              interests={interests}
+              settings={settings}
+              updateSetting={updateSetting}
+              openHistory={() => setActivePage('history')}
+            />
           )}
         </AnimatePresence>
       </div>
@@ -647,17 +652,28 @@ function HistoryPage({ runs, runEvents, selectedRunId, selectRun }){
 function ActivityRow({ item, index, patchItem }){
   const feedbackOptions = ['good', 'neutral', 'bad']
   const host = getLinkHost(item.link)
+  const metaItems = [
+    item.activity_when && { label: 'when', value: item.activity_when },
+    item.location && { label: 'where', value: item.location },
+    item.venue && { label: 'venue', value: item.venue },
+    host && { label: 'url', value: host },
+  ].filter(Boolean)
+  const displayTitle = cleanActivityTitle(item.title)
 
   return (
     <div className="result-row activity-row">
       <a className="activity-main" href={item.link || '#'} target="_blank" rel="noreferrer">
         <span className="row-index">{String(index + 1).padStart(2, '0')}</span>
-        <span>
-          <strong>{item.title}</strong>
-          <small>
+        <span className="activity-copy">
+          <span className="activity-title">{displayTitle}</span>
+          <span className="activity-meta">
             <span className="source-badge">{item.source || 'source'}</span>
-            {[item.location, item.activity_when, host].filter(Boolean).join(' / ')}
-          </small>
+            {metaItems.map(meta => (
+              <span className="meta-chip" key={`${meta.label}-${meta.value}`}>
+                <em>{meta.label}</em>{meta.value}
+              </span>
+            ))}
+          </span>
         </span>
       </a>
       <div className="activity-actions">
@@ -700,6 +716,14 @@ function formatDate(value){
   } catch {
     return value
   }
+}
+
+function cleanActivityTitle(title){
+  return String(title || 'Untitled activity')
+    .replace(/\s+by\s+[^/]+?(?:\s+\d+\s+attendees?.*)?$/i, '')
+    .replace(/\s+[•-]\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+[A-Z][a-z]{2}\s+\d{1,2}.*$/i, '')
+    .replace(/\s+Every\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun).*$/i, '')
+    .trim() || String(title || 'Untitled activity')
 }
 
 function getLinkHost(link){
@@ -860,7 +884,7 @@ function SourceSelector({ enabledSources, toggleSource }){
   )
 }
 
-function SettingsPage({ interests, settings, updateSetting }){
+function SettingsPage({ interests, settings, updateSetting, openHistory }){
   return (
     <PageShell className="wide-page">
       <PageHeader
@@ -902,6 +926,9 @@ function SettingsPage({ interests, settings, updateSetting }){
         </SettingLine>
         <SettingLine label="email delivery" value="smtp env driven" />
         <SettingLine label="interest signals" value={`${interests.length} saved`} />
+        <SettingLine label="agent trace">
+          <button className="text-command quiet" onClick={openHistory}>view run history</button>
+        </SettingLine>
         <SettingLine label="testing mode">
           <button
             className={`toggle-control subtle ${settings.testingMode ? 'on' : ''}`}
