@@ -651,14 +651,13 @@ function HistoryPage({ runs, runEvents, selectedRunId, selectRun }){
 
 function ActivityRow({ item, index, patchItem }){
   const feedbackOptions = ['good', 'neutral', 'bad']
-  const host = getLinkHost(item.link)
+  const displayTitle = cleanActivityTitle(item.title)
+  const displayWhen = cleanActivityWhen(item.activity_when, displayTitle, item.title)
   const metaItems = [
-    item.activity_when && { label: 'when', value: item.activity_when },
+    displayWhen && { label: 'when', value: displayWhen },
     item.location && { label: 'where', value: item.location },
     item.venue && { label: 'venue', value: item.venue },
-    host && { label: 'url', value: host },
   ].filter(Boolean)
-  const displayTitle = cleanActivityTitle(item.title)
 
   return (
     <div className="result-row activity-row">
@@ -721,18 +720,65 @@ function formatDate(value){
 function cleanActivityTitle(title){
   return String(title || 'Untitled activity')
     .replace(/\s+by\s+[^/]+?(?:\s+\d+\s+attendees?.*)?$/i, '')
-    .replace(/\s+[•-]\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+[A-Z][a-z]{2}\s+\d{1,2}.*$/i, '')
+    .replace(/\s+on\s+\d{1,2}\s+[A-Z][a-z]+(?:\s+\([^)]+\))?/i, '')
+    .replace(/\s+\d{1,2}\s+[A-Z][a-z]+(?:\s+\([^)]+\))?\s+\d{1,2}(?::\d{2})?\s*[–-]\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|AM|PM).*$/i, '')
+    .replace(/\s+\d{1,2}\s+[A-Z][a-z]+(?:\s+\([^)]+\))?\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|AM|PM).*$/i, '')
+    .replace(/\s+@\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|AM|PM)?.*$/i, '')
+    .replace(/\s+[•·-]\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s*[•·-]?\s*[A-Z][a-z]{2}\s+\d{1,2}.*$/i, '')
+    .replace(/\s+[•·-]\s*(?:Today|Tomorrow)\b.*$/i, '')
+    .replace(/\s+[•·-]\s*[A-Z][a-z]{2}\s+\d{1,2}\b.*$/i, '')
+    .replace(/\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s*[•·-]?\s*[A-Z][a-z]{2}\s+\d{1,2}.*$/i, '')
     .replace(/\s+Every\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun).*$/i, '')
+    .replace(/\s+\d{1,2}:\d{2}\s*(?:AM|PM)\b.*$/i, '')
     .trim() || String(title || 'Untitled activity')
 }
 
-function getLinkHost(link){
-  if(!link) return null
-  try {
-    return new URL(link).hostname.replace(/^www\./, '')
-  } catch {
-    return null
-  }
+function cleanActivityWhen(value, title, originalTitle){
+  const raw = String(value || '').trim()
+  const titleText = String(title || '').trim()
+  const originalText = String(originalTitle || '').trim()
+  if(!raw && !originalText) return null
+
+  const titlePattern = escapeRegExp(titleText)
+  let cleaned = (raw || originalText)
+    .replace(new RegExp(`^${titlePattern}\\s*`, 'i'), '')
+    .replace(/^Every\s+/i, '')
+    .replace(/\s+by\s+[^/]+?(?:\s+\d+\s+attendees?.*)?$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const dateMatch = findDateTime(cleaned) || findDateTime(originalText) || findDateOnly(cleaned) || findDateOnly(originalText)
+
+  if(dateMatch) cleaned = normalizeWhen(dateMatch[0])
+  if(cleaned.toLowerCase() === titleText.toLowerCase()) return null
+  return cleaned || null
+}
+
+function findDateTime(text){
+  return String(text || '').match(/\d{1,2}\s+[A-Z][a-z]+(?:\s+\([^)]+\))?\s+\d{1,2}(?::\d{2})?\s*(?:[–-]\s*\d{1,2}(?::\d{2})?)?\s*(?:a\.?m\.?|p\.?m\.?|AM|PM)(?:\s+[A-Z]{2,4})?/i)
+    || String(text || '').match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s*[•·-]?\s*[A-Z][a-z]{2}\s+\d{1,2}\s*(?:[•·-]\s*)?(?:@?\s*)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|AM|PM)(?:\s+[A-Z]{2,4})?/i)
+    || String(text || '').match(/[A-Z][a-z]{2}\s+\d{1,2}\s*(?:[•·-]\s*)?(?:@?\s*)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|AM|PM)(?:\s+[A-Z]{2,4})?/i)
+    || String(text || '').match(/@\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|AM|PM)?\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s*[•·-]?\s*[A-Z][a-z]{2}\s+\d{1,2}/i)
+}
+
+function findDateOnly(text){
+  return String(text || '').match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s*[•·-]?\s*[A-Z][a-z]{2}\s+\d{1,2}/i)
+    || String(text || '').match(/[A-Z][a-z]{2}\s+\d{1,2}/i)
+    || String(text || '').match(/\d{1,2}\s+[A-Z][a-z]+(?:\s+\([^)]+\))?/i)
+}
+
+function normalizeWhen(value){
+  return String(value || '')
+    .replace(/\s*[•·]\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\bp\.?m\.?\b/ig, 'PM')
+    .replace(/\ba\.?m\.?\b/ig, 'AM')
+    .replace(/^@\s*/, '')
+    .trim()
+}
+
+function escapeRegExp(value){
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function FocusPage({ focus, toggleFocus }){
