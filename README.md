@@ -12,6 +12,7 @@ When `OPENAI_API_KEY` is set, the agent uses an LLM as its planning and judgemen
 - it turns the user's interests, focus, location, settings, and feedback history into personalised search queries;
 - it chooses source/query tool calls step by step during the run instead of blindly searching every source;
 - it can open promising result pages during the run and feed inspected page text into extraction;
+- it can explicitly accept or reject candidates during the run before the final safety ranking pass;
 - it extracts clean activity cards from raw scraped candidates;
 - it ranks the whole candidate set comparatively and records why each item was accepted or rejected.
 

@@ -52,7 +52,7 @@ ACTION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "action": {"type": "string", "enum": ["search_source", "open_result", "stop"]},
+        "action": {"type": "string", "enum": ["search_source", "open_result", "accept_candidate", "reject_candidate", "stop"]},
         "source": {"type": ["string", "null"]},
         "query": {"type": ["string", "null"]},
         "candidate_id": {"type": ["string", "null"]},
@@ -181,9 +181,11 @@ class LLMAgentBrain:
                 "Choose exactly one next action for the discovery agent. Use search_source when another "
                 "targeted search is likely to improve the result pool. Use open_result when an unopened "
                 "candidate looks promising and inspecting the page could confirm date, venue, contact, or "
-                "quality. Use stop when enough promising candidates have been inspected/found, the budget is "
+                "quality. Use accept_candidate when a candidate clearly fits the user and has enough concrete "
+                "details. Use reject_candidate when a candidate is stale, vague, irrelevant, duplicated, or "
+                "low quality. Use stop when enough promising candidates have been accepted, the budget is "
                 "nearly spent, or remaining actions look repetitive. Avoid repeating searched_pairs and avoid "
-                "opening candidate ids listed in opened_candidate_ids."
+                "opening/deciding candidate ids already listed in state."
             ),
         }
         try:
@@ -201,16 +203,16 @@ class LLMAgentBrain:
         query = data.get("query")
         candidate_id = data.get("candidate_id")
         url = data.get("url")
-        if action == "open_result":
+        if action in {"open_result", "accept_candidate", "reject_candidate"}:
             if not candidate_id and not url:
-                return {"action": "stop", "source": None, "query": None, "candidate_id": None, "url": None, "reason": "LLM chose open_result without a candidate"}
+                return {"action": "stop", "source": None, "query": None, "candidate_id": None, "url": None, "reason": "LLM chose a candidate action without a candidate"}
             return {
-                "action": "open_result",
+                "action": action,
                 "source": None,
                 "query": None,
                 "candidate_id": str(candidate_id) if candidate_id else None,
                 "url": str(url) if url else None,
-                "reason": str(data.get("reason") or "LLM selected a result to inspect")[:240],
+                "reason": str(data.get("reason") or "LLM selected a candidate action")[:240],
             }
         if action != "search_source":
             return {"action": "stop", "source": None, "query": None, "candidate_id": None, "url": None, "reason": data.get("reason") or "LLM chose to stop"}

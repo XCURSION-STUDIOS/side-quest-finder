@@ -84,6 +84,9 @@ class DiscoveryAgent:
         self.query_plan = None
         self.candidate_counter = 0
         self.opened_candidate_ids = set()
+        self.accepted_candidate_ids = set()
+        self.rejected_candidate_ids = set()
+        self.candidate_statuses = {}
 
     def build_fallback_queries(self) -> List[str]:
         base_terms = self.context.interests or ["clubs", "communities", "activities"]
@@ -193,6 +196,23 @@ class DiscoveryAgent:
                     })
                     continue
 
+                if action["action"] in {"accept_candidate", "reject_candidate"}:
+                    decided = self.apply_candidate_decision(candidates, action, step + 1)
+                    observations.append({
+                        "step": step + 1,
+                        "tool": action["action"],
+                        "candidate_id": action.get("candidate_id"),
+                        "decided": decided,
+                    })
+                    if len(self.accepted_candidate_ids) >= self.context.max_finds:
+                        self.events.append({
+                            "status": "agent_stop",
+                            "reason": "Accepted enough candidates for this run.",
+                            "metadata": {"step": step + 1, "accepted_count": len(self.accepted_candidate_ids)},
+                        })
+                        break
+                    continue
+
                 if action["action"] != "search_source":
                     self.events.append({
                         "status": "agent_stop",
@@ -244,6 +264,55 @@ class DiscoveryAgent:
                     break
 
         return candidates
+
+    def apply_candidate_decision(self, candidates: List[Dict[str, Any]], action: Dict[str, Any], step: int) -> bool:
+        candidate = self.find_candidate(candidates, action.get("candidate_id"), action.get("url"))
+        if not candidate:
+            self.events.append({
+                "status": "decision_error",
+                "reason": "Agent tried to decide on a candidate that is no longer available.",
+                "url": action.get("url"),
+                "metadata": {"step": step, "candidate_id": action.get("candidate_id"), "action": action.get("action")},
+            })
+            return False
+
+        candidate_id = candidate.get("_agent_id")
+        decision = "accepted" if action["action"] == "accept_candidate" else "rejected"
+        if candidate_id in self.accepted_candidate_ids or candidate_id in self.rejected_candidate_ids:
+            self.events.append({
+                "source": candidate.get("source"),
+                "status": "decision_skipped",
+                "reason": "Candidate already has an agent decision.",
+                "item_title": candidate.get("title"),
+                "item_link": candidate.get("link"),
+                "metadata": {"step": step, "candidate_id": candidate_id, "decision": self.candidate_statuses.get(candidate_id)},
+            })
+            return False
+
+        metadata = candidate.get("metadata") or {}
+        metadata["agent_decision"] = decision
+        metadata["agent_decision_reason"] = action.get("reason")
+        candidate["metadata"] = metadata
+        self.candidate_statuses[candidate_id] = decision
+        if decision == "accepted":
+            self.accepted_candidate_ids.add(candidate_id)
+            candidate["score"] = max(float(candidate.get("score") or 0), 9.0)
+        else:
+            self.rejected_candidate_ids.add(candidate_id)
+            candidate["score"] = 0
+
+        self.events.append({
+            "source": candidate.get("source"),
+            "query": candidate.get("tags"),
+            "url": candidate.get("link"),
+            "status": f"candidate_{decision}",
+            "reason": action.get("reason"),
+            "item_title": candidate.get("title"),
+            "item_link": candidate.get("link"),
+            "score": candidate.get("score", 0),
+            "metadata": {"step": step, "candidate_id": candidate_id},
+        })
+        return True
 
     async def open_result(self, client: httpx.AsyncClient, candidates: List[Dict[str, Any]], action: Dict[str, Any], step: int) -> bool:
         candidate = self.find_candidate(candidates, action.get("candidate_id"), action.get("url"))
@@ -319,26 +388,36 @@ class DiscoveryAgent:
         return True
 
     async def finalize_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        scored = [self.score_candidate(candidate) for candidate in candidates]
+        scored = [self.score_candidate(candidate) for candidate in candidates if self.candidate_status(candidate) != "rejected"]
         scored = await LLMExtractor().refine_candidates(scored, {
             **self.llm_context(),
             "phase": "extract_activity_cards",
         })
         scored = [self.score_candidate(candidate) for candidate in scored]
         scored = await LLMAgentBrain().rank_candidates(scored, self.llm_context(), self.context.max_finds)
-        scored = [candidate for candidate in scored if candidate["score"] > 0]
-        scored = sorted(scored, key=lambda candidate: candidate["score"], reverse=True)
+        agent_accepted = [candidate for candidate in scored if self.candidate_status(candidate) == "accepted"]
+        for candidate in agent_accepted:
+            candidate["score"] = max(float(candidate.get("score") or 0), 9.0)
+        ranked_pool = [
+            candidate
+            for candidate in scored
+            if candidate["score"] > 0 and self.candidate_status(candidate) not in {"accepted", "rejected"}
+        ]
+        ranked_pool = sorted(ranked_pool, key=lambda candidate: candidate["score"], reverse=True)
 
-        accepted = dedupe_candidates(scored)[: self.context.max_finds]
+        accepted = dedupe_candidates(agent_accepted + ranked_pool)[: self.context.max_finds]
         accepted_keys = {(item.get("title", "").lower(), item.get("link", "")) for item in accepted}
         for candidate in candidates:
             key = (candidate.get("title", "").lower(), candidate.get("link", ""))
             accepted_candidate = key in accepted_keys
+            status = "accepted" if accepted_candidate else "rejected"
+            if self.candidate_status(candidate) == "rejected":
+                status = "rejected"
             self.events.append({
                 "source": candidate.get("source"),
                 "query": candidate.get("tags"),
                 "url": (candidate.get("metadata") or {}).get("source_url"),
-                "status": "accepted" if accepted_candidate else "rejected",
+                "status": status,
                 "reason": build_acceptance_reason(candidate, accepted_candidate),
                 "item_title": candidate.get("title"),
                 "item_link": candidate.get("link"),
@@ -347,6 +426,10 @@ class DiscoveryAgent:
             })
 
         return accepted
+
+    def candidate_status(self, candidate: Dict[str, Any]) -> Optional[str]:
+        candidate_id = candidate.get("_agent_id") or (candidate.get("metadata") or {}).get("agent_candidate_id")
+        return self.candidate_statuses.get(candidate_id)
 
     def tool_budget(self) -> int:
         if self.context.discovery_mode == "wide":
@@ -375,6 +458,7 @@ class DiscoveryAgent:
             metadata = candidate.get("metadata") or {}
             metadata["agent_candidate_id"] = candidate_id
             candidate["metadata"] = metadata
+            self.candidate_statuses[candidate_id] = "new"
 
     def find_candidate(self, candidates: List[Dict[str, Any]], candidate_id: Optional[str], url: Optional[str]):
         for candidate in candidates:
@@ -410,6 +494,10 @@ class DiscoveryAgent:
             "accepted_target": self.context.max_finds,
             "searched_pairs": [f"{source}:{query}" for source, query in sorted(searched_pairs)][-24:],
             "opened_candidate_ids": sorted(self.opened_candidate_ids)[-24:],
+            "accepted_candidate_ids": sorted(self.accepted_candidate_ids)[-24:],
+            "rejected_candidate_ids": sorted(self.rejected_candidate_ids)[-24:],
+            "accepted_count": len(self.accepted_candidate_ids),
+            "rejected_count": len(self.rejected_candidate_ids),
             "recent_observations": observations[-8:],
             "openable_candidates": [
                 {
@@ -421,7 +509,7 @@ class DiscoveryAgent:
                     "score": candidate.get("score"),
                 }
                 for candidate in top_candidates
-                if candidate.get("_agent_id") and candidate.get("_agent_id") not in self.opened_candidate_ids
+                if candidate.get("_agent_id") and self.candidate_status(candidate) not in {"accepted", "rejected"}
             ][:8],
             "top_candidate_snapshots": [
                 {
@@ -524,6 +612,12 @@ class DiscoveryAgent:
         if any(bad in text for bad in bad_terms):
             score -= 2.5
 
+        metadata = candidate.get("metadata") or {}
+        if metadata.get("agent_decision") == "accepted":
+            score += 5
+        elif metadata.get("agent_decision") == "rejected":
+            score = 0
+
         candidate["score"] = round(max(score, 0), 2)
         return candidate
 
@@ -558,6 +652,8 @@ def dedupe_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def build_acceptance_reason(candidate: Dict[str, Any], accepted: bool) -> str:
     metadata = candidate.get("metadata") or {}
+    if metadata.get("agent_decision_reason"):
+        return metadata["agent_decision_reason"]
     if metadata.get("llm_ranking_reason"):
         return metadata["llm_ranking_reason"]
     if metadata.get("llm_reason"):
