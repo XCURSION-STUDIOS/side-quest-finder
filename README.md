@@ -61,3 +61,9 @@ cd frontend
 npm install
 npm run dev
 ```
+
+Run backend tests:
+
+```powershell
+python -m unittest discover -s backend\tests -v
+```
