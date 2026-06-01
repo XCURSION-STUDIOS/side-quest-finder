@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from backend.app.agent import (
     DEFAULT_SETTINGS,
@@ -11,6 +12,18 @@ from backend.app.browser_tools import browser_open_enabled, should_try_browser_o
 from backend.app.llm_brain import ACTION_SCHEMA
 
 
+LLM_ENV_KEYS = [
+    "LLM_PROVIDER",
+    "LLM_API_KEY",
+    "LLM_MODEL",
+    "LLM_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_MODEL",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+]
+
+
 def make_agent(max_finds=3):
     settings = {**DEFAULT_SETTINGS, "maxFinds": max_finds}
     return DiscoveryAgent(DiscoveryContext(
@@ -18,6 +31,16 @@ def make_agent(max_finds=3):
         focus=["make_friends"],
         settings=settings,
         feedback_profile={},
+    ))
+
+
+def make_agent_with_feedback(feedback_profile, max_finds=3):
+    settings = {**DEFAULT_SETTINGS, "maxFinds": max_finds}
+    return DiscoveryAgent(DiscoveryContext(
+        interests=["climbing"],
+        focus=["make_friends"],
+        settings=settings,
+        feedback_profile=feedback_profile,
     ))
 
 
@@ -36,11 +59,15 @@ def make_candidate(title, link, score=0):
 
 class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.previous_api_key = os.environ.pop("OPENAI_API_KEY", None)
+        self.previous_llm_env = {key: os.environ.get(key) for key in LLM_ENV_KEYS}
+        for key in LLM_ENV_KEYS:
+            os.environ.pop(key, None)
 
     def tearDown(self):
-        if self.previous_api_key:
-            os.environ["OPENAI_API_KEY"] = self.previous_api_key
+        for key in LLM_ENV_KEYS:
+            os.environ.pop(key, None)
+            if self.previous_llm_env[key] is not None:
+                os.environ[key] = self.previous_llm_env[key]
 
     def test_fallback_queries_include_interest_and_focus_terms(self):
         agent = make_agent()
@@ -109,6 +136,24 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("https://example.test/rejected", links)
         self.assertLessEqual(len(results), 2)
 
+    async def test_finalize_excludes_previously_seen_items(self):
+        agent = make_agent_with_feedback({
+            "seen_links": ["https://example.test/seen"],
+            "seen_titles": ["seen climbing social"],
+        })
+        candidates = [
+            make_candidate("Seen climbing social", "https://example.test/seen", score=99),
+            make_candidate("Fresh climbing social", "https://example.test/fresh", score=4),
+        ]
+        agent.assign_candidate_ids(candidates)
+
+        results = await agent.finalize_candidates(candidates)
+        links = [item["link"] for item in results]
+
+        self.assertNotIn("https://example.test/seen", links)
+        self.assertIn("https://example.test/fresh", links)
+        self.assertTrue(candidates[0]["metadata"]["seen_before"])
+
     def test_extract_page_text_removes_noise_and_keeps_main_content(self):
         html = """
         <html>
@@ -138,6 +183,35 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("accept_candidate", actions)
         self.assertIn("reject_candidate", actions)
         self.assertIn("stop", actions)
+
+    def test_next_unsearched_action_prefers_new_source_for_diversity(self):
+        agent = make_agent()
+        query_plan = [{"query": "social events", "intent": "social", "reason": "test"}]
+        searched_pairs = {("meetup", "social events")}
+
+        action = agent.next_unsearched_action(query_plan, searched_pairs, prefer_new_source={"meetup"})
+
+        self.assertEqual(action["action"], "search_source")
+        self.assertNotEqual(action["source"], "meetup")
+        self.assertEqual(action["query"], "social events")
+
+    async def test_scrape_source_errors_are_not_returned_as_candidates(self):
+        agent = make_agent()
+        search = {
+            "source": "reddit",
+            "query": "social events",
+            "url": "https://example.test/reddit",
+            "search": object(),
+        }
+        failing_scraper = AsyncMock()
+        failing_scraper.scrape.side_effect = RuntimeError("blocked by source")
+
+        with patch("backend.app.agent.SOURCE_SCRAPERS", {"reddit": failing_scraper}):
+            results = await agent.scrape_source(AsyncMock(), search)
+
+        self.assertEqual(results, [])
+        self.assertEqual(agent.events[-1]["status"], "source_error")
+        self.assertIn("blocked by source", agent.events[-1]["reason"])
 
     def test_browser_open_is_feature_flagged_and_only_for_weak_pages(self):
         os.environ.pop("XC_BROWSER_OPEN", None)

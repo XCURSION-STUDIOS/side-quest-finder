@@ -1,8 +1,9 @@
 import json
-import os
 from typing import Any, Dict, List
 
 import httpx
+
+from .llm_config import get_llm_config
 
 
 ACTIVITY_SCHEMA = {
@@ -26,9 +27,10 @@ ACTIVITY_SCHEMA = {
 
 class LLMExtractor:
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        self.enabled = bool(self.api_key)
+        self.config = get_llm_config()
+        self.api_key = self.config.api_key
+        self.model = self.config.model
+        self.enabled = self.config.enabled
 
     async def refine_candidates(self, candidates: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not self.enabled:
@@ -52,7 +54,7 @@ class LLMExtractor:
         }
         try:
             response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
+                self.config.chat_completions_url,
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                 json={
                     "model": self.model,

@@ -37,6 +37,24 @@ DEMO_ITEMS = [
     },
 ]
 
+def item_to_dict(item: Item):
+    return {
+        "id": item.id,
+        "title": item.title,
+        "link": item.link,
+        "source": item.source,
+        "summary": item.summary,
+        "activity_when": item.activity_when,
+        "venue": item.venue,
+        "location": item.location,
+        "contact": item.contact,
+        "score": item.score,
+        "shortlisted": item.shortlisted,
+        "feedback": item.feedback,
+        "found_at": item.found_at.isoformat(),
+    }
+
+
 def generate_daily_summary(interests: List[str] = None, limit: int = 10):
     interests = interests or []
     today = datetime.utcnow()
@@ -54,24 +72,7 @@ def generate_daily_summary(interests: List[str] = None, limit: int = 10):
         items = [i for i in items if matches(i)]
 
     items = sorted(items, key=lambda i: i.found_at, reverse=True)[:limit]
-    return [
-        {
-            "id": i.id,
-            "title": i.title,
-            "link": i.link,
-            "source": i.source,
-            "summary": i.summary,
-            "activity_when": i.activity_when,
-            "venue": i.venue,
-            "location": i.location,
-            "contact": i.contact,
-            "score": i.score,
-            "shortlisted": i.shortlisted,
-            "feedback": i.feedback,
-            "found_at": i.found_at.isoformat(),
-        }
-        for i in items
-    ]
+    return [item_to_dict(i) for i in items]
 
 def get_demo_items(limit: int = 10):
     return DEMO_ITEMS[:limit]

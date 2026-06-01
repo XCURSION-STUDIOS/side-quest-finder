@@ -7,3 +7,4 @@ apscheduler
 sqlmodel
 python-dotenv
 playwright
+psycopg2-binary

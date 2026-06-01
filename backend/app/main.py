@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
@@ -10,9 +12,15 @@ from .connectors import connector_status
 
 app = FastAPI(title="Side Quest Finder Agent")
 
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("XC_CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,7 +39,8 @@ def on_startup():
             p.set_settings(DEFAULT_SETTINGS)
             session.add(p)
             session.commit()
-    start_scheduler()
+    if str(os.getenv("XC_ENABLE_SCHEDULER", "1")).lower() in {"1", "true", "yes", "on"}:
+        start_scheduler()
 
 
 @app.get("/health")
@@ -150,14 +159,21 @@ def update_item(item_id: int, payload: dict):
 
 @app.post("/run-scrape")
 def run_scrape():
-    run_scrape_job(force=True)
-    return {"ok": True}
+    result = run_scrape_job(force=True)
+    return result or {"ok": True}
 
 
 @app.post("/discovery/run")
 def run_discovery():
-    run_scrape_job(force=True)
-    return daily_summary()
+    result = run_scrape_job(force=True) or {}
+    return {
+        "items": result.get("items", []),
+        "run_id": result.get("run_id"),
+        "status": result.get("status"),
+        "summary": result.get("summary"),
+        "accepted_count": result.get("accepted_count", 0),
+        "new_count": result.get("new_count", 0),
+    }
 
 
 @app.get("/discovery/runs")

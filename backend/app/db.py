@@ -1,12 +1,16 @@
+import os
+
 from sqlmodel import create_engine, SQLModel
 from sqlalchemy import text
 
-DATABASE_URL = "sqlite:///./data.db"
-engine = create_engine(DATABASE_URL, echo=False)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
-    ensure_sqlite_columns()
+    if DATABASE_URL.startswith("sqlite"):
+        ensure_sqlite_columns()
 
 def ensure_sqlite_columns():
     """Lightweight local migration support for the prototype SQLite database."""

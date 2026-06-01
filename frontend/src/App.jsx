@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import XCursionLogo from './XCursionLogo'
 
-const API = 'http://localhost:8000'
+const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 const SUPPORTED_SERVICES = [
   'meetup',
@@ -112,6 +112,8 @@ function App(){
   const [runs, setRuns] = useState([])
   const [runEvents, setRunEvents] = useState([])
   const [selectedRunId, setSelectedRunId] = useState(null)
+  const [discoveryStatus, setDiscoveryStatus] = useState({ state: 'idle', message: '' })
+  const [discoverySteps, setDiscoverySteps] = useState([])
   const [showServices, setShowServices] = useState(false)
   const [settings, setSettings] = useState({
     dailySummary: true,
@@ -243,15 +245,68 @@ function App(){
       .catch(() => setRunEvents([]))
   }
 
-  function runDiscovery(){
-    fetch(`${API}/discovery/run`, { method: 'POST' })
-      .then(response => response.json())
-      .then(data => {
-        setItems(data.items || [])
-        fetchShortlist()
-        fetchRuns()
+  async function runDiscovery(){
+    setDiscoveryStatus({ state: 'running', message: 'agent is searching sources and judging candidates...' })
+    setDiscoverySteps([{ label: 'starting manual discovery run' }])
+    const startedAt = Date.now()
+    let activeRunId = null
+    const pollProgress = async () => {
+      try {
+        const runsResponse = await fetch(`${API}/discovery/runs`)
+        const runsData = await runsResponse.json()
+        const nextRuns = runsData.runs || []
+        const activeRun = nextRuns.find(run => run.status === 'running')
+          || nextRuns.find(run => Math.abs(new Date(run.started_at).getTime() - startedAt) < 30000)
+          || nextRuns[0]
+        if(!activeRun) return
+
+        activeRunId = activeRun.id
+        const eventsResponse = await fetch(`${API}/discovery/runs/${activeRun.id}/events`)
+        const eventsData = await eventsResponse.json()
+        const steps = summarizeProgressEvents(eventsData.events || [], activeRun)
+        if(steps.length) setDiscoverySteps(steps)
+      } catch {
+        // Keep the current visible step; the run request itself will surface any final error.
+      }
+    }
+    const progressTimer = window.setInterval(pollProgress, 1400)
+    pollProgress()
+    try {
+      const response = await fetch(`${API}/discovery/run`, { method: 'POST' })
+      const data = await response.json().catch(() => ({}))
+      if(!response.ok){
+        throw new Error(data.detail || `agent run failed (${response.status})`)
+      }
+
+      const nextItems = data.items || []
+      setItems(nextItems)
+      fetchShortlist()
+      fetchRuns()
+      await pollProgress()
+      const limit = Number(settings.maxFinds) || 10
+      const acceptedCount = Number(data.accepted_count || nextItems.length)
+      const newCount = Number(data.new_count || nextItems.length)
+      let completeMessage = nextItems.length ? `run complete: ${nextItems.length} fresh discoveries returned` : 'run complete: no new discoveries'
+      if(newCount < acceptedCount){
+        completeMessage = `run complete: ${newCount} fresh discoveries returned; ${acceptedCount - newCount} had already been saved`
+      } else if(newCount > 0 && newCount < limit){
+        completeMessage = `run complete: ${newCount} fresh discoveries returned; fewer than the ${limit} limit survived the filters`
+      }
+      setDiscoveryStatus({
+        state: 'complete',
+        message: completeMessage,
       })
-      .catch(() => setItems([]))
+    } catch (error) {
+      setDiscoveryStatus({
+        state: 'error',
+        message: error.message || 'agent run failed',
+      })
+    } finally {
+      window.clearInterval(progressTimer)
+      if(activeRunId){
+        fetchRunEvents(activeRunId)
+      }
+    }
   }
 
   function patchItem(itemId, payload){
@@ -342,6 +397,8 @@ function App(){
               key="briefing"
               items={items}
               runDiscovery={runDiscovery}
+              discoveryStatus={discoveryStatus}
+              discoverySteps={discoverySteps}
               settings={settings}
               patchItem={patchItem}
             />
@@ -523,8 +580,9 @@ function DiscoverPage({ items, openBriefing }){
   )
 }
 
-function BriefingPage({ items, runDiscovery, settings, patchItem }){
+function BriefingPage({ items, runDiscovery, discoveryStatus, discoverySteps, settings, patchItem }){
   const visibleLimit = Number(settings.maxFinds) || 10
+  const isRunning = discoveryStatus.state === 'running'
 
   return (
     <PageShell className="wide-page">
@@ -534,8 +592,25 @@ function BriefingPage({ items, runDiscovery, settings, patchItem }){
       />
       <div className="briefing-toolbar">
         <span>{settings.dailySummary ? `limit: ${visibleLimit} discoveries / day` : 'daily summary paused'}</span>
-        <button className="subtle-command" onClick={runDiscovery}>run agent manually</button>
+        <button className="subtle-command" onClick={runDiscovery} disabled={isRunning}>
+          {isRunning ? 'agent running...' : 'run agent manually'}
+        </button>
       </div>
+      {discoveryStatus.message && (
+        <div className={`run-status ${discoveryStatus.state}`} role="status">
+          {discoveryStatus.message}
+        </div>
+      )}
+      {discoverySteps.length > 0 && discoveryStatus.state !== 'idle' && (
+        <div className="run-steps" aria-label="Agent progress">
+          {discoverySteps.map((step, index) => (
+            <div className="run-step" key={`${step.label}-${index}`}>
+              <span>{String(index + 1).padStart(2, '0')}</span>
+              <p>{step.label}</p>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="result-list">
         {items && items.length > 0 ? (
           items.slice(0, visibleLimit).map((item, index) => (
@@ -715,6 +790,49 @@ function formatDate(value){
   } catch {
     return value
   }
+}
+
+function summarizeProgressEvents(events, run){
+  const steps = []
+  if(run?.status === 'running'){
+    steps.push({ label: `run ${run.id} started` })
+  }
+
+  const relevantEvents = events.slice(-12)
+  relevantEvents.forEach(event => {
+    const source = event.source ? `${event.source}` : 'agent'
+    const query = event.query ? `: ${event.query}` : ''
+    const title = event.item_title ? ` - ${cleanActivityTitle(event.item_title)}` : ''
+    const reason = event.reason ? ` (${event.reason})` : ''
+
+    if(event.status === 'planned_query'){
+      steps.push({ label: `planned query${query}${reason}` })
+    } else if(event.status === 'agent_action'){
+      steps.push({ label: `${source} action${query}${title}${reason}` })
+    } else if(event.status === 'searched'){
+      steps.push({ label: `searched ${source}${query}` })
+    } else if(event.status === 'candidates_found'){
+      steps.push({ label: `${source} returned candidates${query}${reason}` })
+    } else if(event.status === 'opened_result' || event.status === 'browser_opened_result'){
+      steps.push({ label: `opened result${title}${reason}` })
+    } else if(event.status === 'candidate_accepted' || event.status === 'accepted'){
+      steps.push({ label: `accepted${title}${reason}` })
+    } else if(event.status === 'candidate_rejected' || event.status === 'rejected'){
+      steps.push({ label: `rejected${title}${reason}` })
+    } else if(event.status === 'source_error' || event.status === 'open_error' || event.status === 'browser_open_error'){
+      steps.push({ label: `${source} issue${query}${reason}` })
+    } else if(event.status === 'agent_stop'){
+      steps.push({ label: `agent stopped searching${reason}` })
+    }
+  })
+
+  if(run?.status === 'completed'){
+    steps.push({ label: run.summary || 'run completed' })
+  } else if(run?.status === 'failed'){
+    steps.push({ label: run.summary || 'run failed' })
+  }
+
+  return steps.slice(-8)
 }
 
 function cleanActivityTitle(title){

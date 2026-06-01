@@ -172,8 +172,10 @@ class DiscoveryAgent:
         candidates = []
         query_plan = self.query_plan or await self.build_query_plan()
         searched_pairs = set()
+        searched_source_names = set()
         observations = []
         max_tool_calls = self.tool_budget()
+        min_source_count = self.min_source_count()
 
         async with httpx.AsyncClient(
             timeout=20,
@@ -215,16 +217,37 @@ class DiscoveryAgent:
                     continue
 
                 if action["action"] != "search_source":
-                    self.events.append({
-                        "status": "agent_stop",
-                        "reason": action.get("reason"),
-                        "metadata": {"step": step, "candidate_count": len(candidates)},
-                    })
-                    break
+                    if len(searched_source_names) < min_source_count:
+                        fallback = self.next_unsearched_action(query_plan, searched_pairs, prefer_new_source=searched_source_names)
+                        if fallback:
+                            self.events.append({
+                                "status": "agent_fallback",
+                                "reason": f"{action.get('reason')} Falling back to another source for diversity.",
+                                "metadata": {
+                                    "step": step,
+                                    "candidate_count": len(candidates),
+                                    "searched_sources": sorted(searched_source_names),
+                                },
+                            })
+                            action = fallback
+                        else:
+                            self.events.append({
+                                "status": "agent_stop",
+                                "reason": action.get("reason"),
+                                "metadata": {"step": step, "candidate_count": len(candidates)},
+                            })
+                            break
+                    else:
+                        self.events.append({
+                            "status": "agent_stop",
+                            "reason": action.get("reason"),
+                            "metadata": {"step": step, "candidate_count": len(candidates)},
+                        })
+                        break
 
                 pair = (action["source"], action["query"].lower())
                 if pair in searched_pairs:
-                    fallback = self.next_unsearched_action(query_plan, searched_pairs)
+                    fallback = self.next_unsearched_action(query_plan, searched_pairs, prefer_new_source=searched_source_names)
                     if not fallback:
                         self.events.append({
                             "status": "agent_stop",
@@ -236,6 +259,7 @@ class DiscoveryAgent:
                     pair = (action["source"], action["query"].lower())
 
                 searched_pairs.add(pair)
+                searched_source_names.add(action["source"])
                 self.events.append({
                     "source": action["source"],
                     "query": action["query"],
@@ -256,7 +280,7 @@ class DiscoveryAgent:
                     "query": action["query"],
                     "found": found_count,
                 })
-                if len(candidates) >= self.context.max_finds * 6 and step >= 4:
+                if len(candidates) >= self.context.max_finds * 6 and step >= 4 and len(searched_source_names) >= min_source_count:
                     self.events.append({
                         "status": "agent_stop",
                         "reason": "Candidate budget reached; moving to extraction and ranking.",
@@ -418,7 +442,19 @@ class DiscoveryAgent:
         return True
 
     async def finalize_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        scored = [self.score_candidate(candidate) for candidate in candidates if self.candidate_status(candidate) != "rejected"]
+        fresh_candidates = []
+        for candidate in candidates:
+            if self.candidate_status(candidate) == "rejected":
+                continue
+            if self.previously_seen(candidate):
+                metadata = candidate.get("metadata") or {}
+                metadata["seen_before"] = True
+                candidate["metadata"] = metadata
+                candidate["score"] = 0
+                continue
+            fresh_candidates.append(candidate)
+
+        scored = [self.score_candidate(candidate) for candidate in fresh_candidates]
         scored = await LLMExtractor().refine_candidates(scored, {
             **self.llm_context(),
             "phase": "extract_activity_cards",
@@ -468,6 +504,12 @@ class DiscoveryAgent:
             return 8
         return 12
 
+    def min_source_count(self) -> int:
+        available_count = len(self.available_sources())
+        if self.context.discovery_mode == "precise":
+            return min(2, available_count)
+        return min(3, available_count)
+
     def available_sources(self) -> List[str]:
         return [source for source in self.context.enabled_sources if source in SOURCE_SCRAPERS]
 
@@ -498,10 +540,21 @@ class DiscoveryAgent:
                 return candidate
         return None
 
-    def next_unsearched_action(self, query_plan: List[Dict[str, Any]], searched_pairs: set) -> Optional[Dict[str, str]]:
+    def next_unsearched_action(
+        self,
+        query_plan: List[Dict[str, Any]],
+        searched_pairs: set,
+        prefer_new_source: Optional[set] = None,
+    ) -> Optional[Dict[str, str]]:
+        sources = self.available_sources()
+        if prefer_new_source is not None:
+            fresh_sources = [source for source in sources if source not in prefer_new_source]
+            if fresh_sources:
+                sources = fresh_sources + [source for source in sources if source in prefer_new_source]
+
         for entry in query_plan:
             query = entry["query"]
-            for source in self.available_sources():
+            for source in sources:
                 if (source, query.lower()) not in searched_pairs:
                     return {
                         "action": "search_source",
@@ -593,17 +646,16 @@ class DiscoveryAgent:
                 "reason": str(exc)[:240],
                 "metadata": {},
             })
-            return [{
-                "title": f"{source['source']} search unavailable for {source['query']}",
-                "link": source["url"],
-                "source": source["source"],
-                "summary": str(exc)[:180],
-                "tags": source["query"],
-                "metadata": {"status": "source_error", "query": source["query"]},
-                "score": 0,
-            }]
+            return []
 
     def score_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if self.previously_seen(candidate):
+            metadata = candidate.get("metadata") or {}
+            metadata["seen_before"] = True
+            candidate["metadata"] = metadata
+            candidate["score"] = 0
+            return candidate
+
         text = " ".join(filter(None, [
             candidate.get("title"),
             candidate.get("summary"),
@@ -651,6 +703,14 @@ class DiscoveryAgent:
         candidate["score"] = round(max(score, 0), 2)
         return candidate
 
+    def previously_seen(self, candidate: Dict[str, Any]) -> bool:
+        feedback_profile = self.context.feedback_profile or {}
+        seen_links = set(feedback_profile.get("seen_links") or [])
+        seen_titles = set(feedback_profile.get("seen_titles") or [])
+        link = candidate.get("link")
+        title = normalize_title(candidate.get("title"))
+        return bool((link and link in seen_links) or (title and title in seen_titles))
+
 
 def clean_text(value: Optional[str]) -> str:
     return " ".join((value or "").split())
@@ -680,8 +740,14 @@ def dedupe_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return output
 
 
+def normalize_title(value: Optional[str]) -> str:
+    return " ".join((value or "").lower().split())
+
+
 def build_acceptance_reason(candidate: Dict[str, Any], accepted: bool) -> str:
     metadata = candidate.get("metadata") or {}
+    if metadata.get("seen_before"):
+        return "already saved from a previous run, so manual discovery skipped it"
     if metadata.get("agent_decision_reason"):
         return metadata["agent_decision_reason"]
     if metadata.get("llm_ranking_reason"):

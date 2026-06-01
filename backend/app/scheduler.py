@@ -5,7 +5,38 @@ from .agent import DEFAULT_SETTINGS, DiscoveryAgent, DiscoveryContext
 from .db import engine
 from .models import DiscoveryRun, DiscoveryRunEvent, Item, Preference
 from .notifications import send_daily_email
+from .utils import item_to_dict
 from sqlmodel import Session, select
+
+
+class LiveEventList(list):
+    def __init__(self, run_id: int):
+        super().__init__()
+        self.run_id = run_id
+
+    def append(self, event):
+        super().append(event)
+        with Session(engine) as session:
+            run_event = discovery_event_from_dict(self.run_id, event)
+            session.add(run_event)
+            session.commit()
+
+
+def discovery_event_from_dict(run_id: int, event: dict) -> DiscoveryRunEvent:
+    run_event = DiscoveryRunEvent(
+        run_id=run_id,
+        source=event.get("source"),
+        query=event.get("query"),
+        url=event.get("url"),
+        status=event.get("status"),
+        reason=event.get("reason"),
+        item_title=event.get("item_title"),
+        item_link=event.get("item_link"),
+        score=event.get("score", 0),
+    )
+    run_event.set_metadata(event.get("metadata") or {})
+    return run_event
+
 
 def run_scrape_job(force: bool = False):
     import asyncio
@@ -35,6 +66,7 @@ def run_scrape_job(force: bool = False):
             settings=settings,
             feedback_profile=feedback_profile,
         ))
+        agent.events = LiveEventList(run_id)
         try:
             items = await agent.run()
             status = "completed"
@@ -46,6 +78,7 @@ def run_scrape_job(force: bool = False):
 
         with Session(engine) as session:
             accepted_count = 0
+            saved_items = []
             for it in items:
                 stmt = select(Item).where(Item.title == it.get("title"), Item.link == it.get("link"))
                 found = session.exec(stmt).first()
@@ -65,22 +98,10 @@ def run_scrape_job(force: bool = False):
                 )
                 obj.set_metadata(it.get("metadata") or {})
                 session.add(obj)
+                session.flush()
+                session.refresh(obj)
+                saved_items.append(item_to_dict(obj))
                 accepted_count += 1
-
-            for event in agent.events:
-                run_event = DiscoveryRunEvent(
-                    run_id=run_id,
-                    source=event.get("source"),
-                    query=event.get("query"),
-                    url=event.get("url"),
-                    status=event.get("status"),
-                    reason=event.get("reason"),
-                    item_title=event.get("item_title"),
-                    item_link=event.get("item_link"),
-                    score=event.get("score", 0),
-                )
-                run_event.set_metadata(event.get("metadata") or {})
-                session.add(run_event)
 
             run = session.get(DiscoveryRun, run_id)
             run.completed_at = datetime.utcnow()
@@ -95,16 +116,33 @@ def run_scrape_job(force: bool = False):
             session.commit()
 
         if status == "completed":
-            send_daily_email(items)
+            send_daily_email(saved_items)
 
-    asyncio.run(_run())
+        return {
+            "ok": status == "completed",
+            "run_id": run_id,
+            "status": status,
+            "summary": summary,
+            "items": saved_items,
+            "accepted_count": len(items),
+            "new_count": len(saved_items),
+        }
+
+    return asyncio.run(_run())
 
 def build_feedback_profile():
-    profile = {"source_weights": {}, "term_weights": {}}
+    profile = {"source_weights": {}, "term_weights": {}, "seen_links": [], "seen_titles": []}
     with Session(engine) as session:
         rated_items = session.exec(
             select(Item).where((Item.feedback != None) | (Item.shortlisted == True))
         ).all()
+        seen_items = session.exec(select(Item)).all()
+
+    for item in seen_items:
+        if item.link:
+            profile["seen_links"].append(item.link)
+        if item.title:
+            profile["seen_titles"].append(normalize_seen_title(item.title))
 
     for item in rated_items:
         weight = 0
@@ -130,6 +168,10 @@ def build_feedback_profile():
             profile["term_weights"][term] = profile["term_weights"].get(term, 0) + weight * 0.12
 
     return profile
+
+
+def normalize_seen_title(value: str) -> str:
+    return " ".join((value or "").lower().split())
 
 def start_scheduler():
     sched = BackgroundScheduler()
