@@ -7,6 +7,7 @@ from backend.app.agent import (
     DiscoveryContext,
     extract_page_text,
 )
+from backend.app.browser_tools import browser_open_enabled, should_try_browser_open
 from backend.app.llm_brain import ACTION_SCHEMA
 
 
@@ -137,6 +138,16 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("accept_candidate", actions)
         self.assertIn("reject_candidate", actions)
         self.assertIn("stop", actions)
+
+    def test_browser_open_is_feature_flagged_and_only_for_weak_pages(self):
+        os.environ.pop("XC_BROWSER_OPEN", None)
+        self.assertFalse(browser_open_enabled())
+
+        os.environ["XC_BROWSER_OPEN"] = "1"
+        self.assertTrue(browser_open_enabled())
+        self.assertTrue(should_try_browser_open("Enable JavaScript to continue"))
+        self.assertTrue(should_try_browser_open("short page"))
+        self.assertFalse(should_try_browser_open(" ".join(["detailed"] * 1000)))
 
 
 if __name__ == "__main__":

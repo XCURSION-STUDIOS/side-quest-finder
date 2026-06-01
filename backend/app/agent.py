@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from bs4 import BeautifulSoup
 
+from .browser_tools import browser_open_enabled, browser_open_text, should_try_browser_open
 from .llm import LLMExtractor
 from .llm_brain import LLMAgentBrain
 from .source_scrapers import SOURCE_SCRAPERS
@@ -365,6 +366,35 @@ class DiscoveryAgent:
             })
             self.opened_candidate_ids.add(candidate_id)
             return False
+
+        if browser_open_enabled() and should_try_browser_open(page_text):
+            try:
+                browser_result = await browser_open_text(url)
+                browser_text = browser_result.get("text") or ""
+                if len(browser_text) > len(page_text):
+                    page_text = browser_text
+                    url = browser_result.get("url") or url
+                self.events.append({
+                    "source": candidate.get("source"),
+                    "query": candidate.get("tags"),
+                    "url": url,
+                    "status": "browser_opened_result",
+                    "reason": f"Browser fallback captured {len(browser_text)} visible text characters.",
+                    "item_title": candidate.get("title"),
+                    "item_link": candidate.get("link"),
+                    "metadata": {"step": step, "candidate_id": candidate_id, "page_chars": len(browser_text)},
+                })
+            except Exception as exc:
+                self.events.append({
+                    "source": candidate.get("source"),
+                    "query": candidate.get("tags"),
+                    "url": url,
+                    "status": "browser_open_error",
+                    "reason": str(exc)[:240],
+                    "item_title": candidate.get("title"),
+                    "item_link": candidate.get("link"),
+                    "metadata": {"step": step, "candidate_id": candidate_id},
+                })
 
         metadata = candidate.get("metadata") or {}
         metadata["opened_url"] = url

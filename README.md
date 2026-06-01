@@ -30,6 +30,7 @@ Optional environment variables:
 - `OPENAI_API_KEY` enables the LLM extraction/ranking pass that turns raw scraped candidates into cleaner activity cards.
 - `OPENAI_MODEL` overrides the extraction model. The default is `gpt-4o-mini`.
 - `EVENTBRITE_TOKEN` switches Eventbrite discovery from public page extraction to the official Eventbrite search API.
+- `XC_BROWSER_OPEN=1` enables optional Playwright browser fallback when a result page returns thin or JavaScript-gated text. Run `python -m playwright install chromium` after installing requirements.
 - `XC_NOTIFY_EMAIL`, `SMTP_HOST`, `SMTP_USERNAME`, and `SMTP_PASSWORD` enable daily email delivery after a successful scheduled or manual run.
 - `SMTP_FROM` and `SMTP_PORT` customise email sender and SMTP port.
 
